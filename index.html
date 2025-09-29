@@ -1,0 +1,477 @@
+/*
+SteelWarehouse.java
+-------------------
+
+Purpose:
+A single-file Java 17+ application implementing a full-stack professional steel warehouse website
+for B2B buyers and contractors in North Karachi. It includes embedded frontend (HTML/CSS/JS),
+backend REST API with embedded H2 database, sample data, admin login, and interactive UI features.
+
+Build & Run:
+1. Ensure Java 17+ is installed.
+2. Compile:
+   javac SteelWarehouse.java
+3. Run:
+   java SteelWarehouse
+4. Open browser at http://localhost:8080
+
+Admin Credentials (demo):
+  username: admin
+  password: Steel@2024NK
+
+Map API Key:
+  This app uses a static embedded map image fallback for location.
+  To enable interactive map with Google Maps JS API:
+  - Obtain API key from https://console.cloud.google.com/apis/credentials
+  - Replace MAP_API_KEY constant below with your key
+  - Uncomment the interactive map JS code in the HTML section
+
+Docker:
+  To build Docker image:
+    docker build -t steelwarehouse-nk .
+  To run container:
+    docker run -p 8080:8080 steelwarehouse-nk
+
+-------------------
+Developer Checklist Before Production:
+- Set a strong admin password in ADMIN_PASSWORD constant.
+- Replace placeholder images with real photos.
+- Enable HTTPS (e.g., behind a reverse proxy).
+- Configure persistent external DB if needed.
+- Add real email sending for inquiry receipt.
+- Replace static map with interactive map and set MAP_API_KEY.
+- Review and tighten rate limiting/security as needed.
+- Add logging and monitoring.
+- Remove or secure /api/docs endpoint.
+
+-------------------
+*/
+
+import java.io.*;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.sql.*;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.regex.Pattern;
+
+import com.sun.net.httpserver.*;
+
+public class SteelWarehouse {
+
+    // --- CONFIGURATION ---
+    private static final int PORT = 8080;
+    private static final String ADMIN_USERNAME = "admin";
+    private static final String ADMIN_PASSWORD = "Steel@2024NK"; // Change before production!
+    private static final String MAP_API_KEY = ""; // Insert Google Maps JS API key here if available
+
+    // Database URL: in-memory for demo; change to file-based for persistence
+    private static final String DB_URL = "jdbc:h2:mem:steelwarehouse;DB_CLOSE_DELAY=-1";
+
+    // Rate limiting: max requests per IP per minute (simple)
+    private static final int MAX_REQUESTS_PER_MINUTE = 60;
+
+    // --- GLOBALS ---
+    private static Connection conn;
+    private static final Map<String, Integer> rateLimitMap = Collections.synchronizedMap(new HashMap<>());
+    private static final Map<String, Long> rateLimitResetMap = Collections.synchronizedMap(new HashMap<>());
+    private static final Map<String, String> adminSessions = Collections.synchronizedMap(new HashMap<>());
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("Starting Steel Warehouse — North Karachi server on port " + PORT + "...");
+        initDatabase();
+        runSanityChecks();
+
+        HttpServer server = HttpServer.create(new InetSocketAddress(PORT), 0);
+        server.createContext("/", SteelWarehouse::handleRoot);
+        server.createContext("/api/contact", SteelWarehouse::handleContact);
+        server.createContext("/api/products", SteelWarehouse::handleProducts);
+        server.createContext("/api/admin/login", SteelWarehouse::handleAdminLogin);
+        server.createContext("/api/admin/orders", SteelWarehouse::handleAdminOrders);
+        server.createContext("/api/docs", SteelWarehouse::handleApiDocs);
+        server.setExecutor(Executors.newFixedThreadPool(10));
+        server.start();
+
+        System.out.println("Server started. Open http://localhost:" + PORT);
+    }
+
+    // --- DATABASE SETUP ---
+    private static void initDatabase() throws SQLException {
+        conn = DriverManager.getConnection(DB_URL);
+        try (Statement st = conn.createStatement()) {
+            // Create tables
+            st.execute("""
+                CREATE TABLE products (
+                    id IDENTITY PRIMARY KEY,
+                    name VARCHAR(100) NOT NULL,
+                    description VARCHAR(500) NOT NULL,
+                    stock_qty INT NOT NULL,
+                    price_per_ton DECIMAL(10,2) NOT NULL,
+                    unit VARCHAR(20) NOT NULL,
+                    image_placeholder VARCHAR(100) NOT NULL
+                );
+            """);
+            st.execute("""
+                CREATE TABLE inquiries (
+                    id IDENTITY PRIMARY KEY,
+                    name VARCHAR(100) NOT NULL,
+                    email VARCHAR(100) NOT NULL,
+                    phone VARCHAR(30) NOT NULL,
+                    message VARCHAR(1000) NOT NULL,
+                    timestamp TIMESTAMP NOT NULL
+                );
+            """);
+            st.execute("""
+                CREATE TABLE admins (
+                    id IDENTITY PRIMARY KEY,
+                    username VARCHAR(50) UNIQUE NOT NULL,
+                    password_hash VARCHAR(100) NOT NULL
+                );
+            """);
+            st.execute("""
+                CREATE TABLE orders (
+                    id IDENTITY PRIMARY KEY,
+                    product_id BIGINT NOT NULL,
+                    quantity INT NOT NULL,
+                    customer_name VARCHAR(100) NOT NULL,
+                    customer_email VARCHAR(100) NOT NULL,
+                    order_date TIMESTAMP NOT NULL,
+                    FOREIGN KEY (product_id) REFERENCES products(id)
+                );
+            """);
+
+            // Insert sample admin (password hashed with simple SHA-256 hex)
+            String adminPassHash = sha256Hex(ADMIN_PASSWORD);
+            st.execute("INSERT INTO admins (username, password_hash) VALUES ('" + ADMIN_USERNAME + "', '" + adminPassHash + "')");
+
+            // Insert sample products
+            st.execute("""
+                INSERT INTO products (name, description, stock_qty, price_per_ton, unit, image_placeholder) VALUES
+                ('Mild Steel Rebar', 'High-quality mild steel reinforcement bars for construction.', 1200, 85000.00, 'ton', 'rebar'),
+                ('Galvanized Steel Sheets', 'Durable galvanized sheets for roofing and cladding.', 500, 95000.00, 'ton', 'sheet'),
+                ('Steel Pipes', 'Strong steel pipes suitable for plumbing and industrial use.', 800, 78000.00, 'ton', 'pipe'),
+                ('Structural Steel Beams', 'I-beams and H-beams for structural frameworks.', 300, 120000.00, 'ton', 'beam');
+            """);
+        }
+    }
+
+    // --- SANITY CHECKS ---
+    private static void runSanityChecks() throws SQLException {
+        try (Statement st = conn.createStatement()) {
+            ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM products");
+            if (rs.next()) {
+                int count = rs.getInt(1);
+                if (count < 1) {
+                    System.err.println("Warning: No products found in database.");
+                } else {
+                    System.out.println("Database initialized with " + count + " products.");
+                }
+            }
+        }
+    }
+
+    // --- HTTP HANDLERS ---
+
+    // Root serves the full frontend HTML page
+    private static void handleRoot(HttpExchange exchange) throws IOException {
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            send405(exchange);
+            return;
+        }
+        if (!rateLimit(exchange)) return;
+
+        String html = buildHtmlPage();
+        byte[] bytes = html.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
+        exchange.sendResponseHeaders(200, bytes.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(bytes);
+        }
+    }
+
+    // POST /api/contact - store inquiry
+    private static void handleContact(HttpExchange exchange) throws IOException {
+        if (!"POST".equals(exchange.getRequestMethod())) {
+            send405(exchange);
+            return;
+        }
+        if (!rateLimit(exchange)) return;
+
+        String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+        Map<String, String> data = parseJson(body);
+        String name = sanitize(data.get("name"));
+        String email = sanitize(data.get("email"));
+        String phone = sanitize(data.get("phone"));
+        String message = sanitize(data.get("message"));
+
+        List<String> errors = new ArrayList<>();
+        if (name == null || name.isBlank()) errors.add("Name is required.");
+        if (email == null || !isValidEmail(email)) errors.add("Valid email is required.");
+        if (phone == null || phone.isBlank()) errors.add("Phone number is required.");
+        if (message == null || message.isBlank()) errors.add("Message is required.");
+
+        if (!errors.isEmpty()) {
+            sendJson(exchange, 400, Map.of("success", false, "errors", errors));
+            return;
+        }
+
+        try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO inquiries (name,email,phone,message,timestamp) VALUES (?,?,?,?,CURRENT_TIMESTAMP)")) {
+            ps.setString(1, name);
+            ps.setString(2, email);
+            ps.setString(3, phone);
+            ps.setString(4, message);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            sendJson(exchange, 500, Map.of("success", false, "error", "Database error."));
+            return;
+        }
+
+        // Normally send transactional email here (template below)
+
+        sendJson(exchange, 200, Map.of("success", true, "message", "Inquiry received. We will contact you shortly."));
+    }
+
+    // GET /api/products - list products
+    private static void handleProducts(HttpExchange exchange) throws IOException {
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            send405(exchange);
+            return;
+        }
+        if (!rateLimit(exchange)) return;
+
+        List<Map<String, Object>> products = new ArrayList<>();
+        try (Statement st = conn.createStatement()) {
+            ResultSet rs = st.executeQuery("SELECT id, name, description, stock_qty, price_per_ton, unit, image_placeholder FROM products ORDER BY name");
+            while (rs.next()) {
+                Map<String, Object> p = new LinkedHashMap<>();
+                p.put("id", rs.getLong("id"));
+                p.put("name", rs.getString("name"));
+                p.put("description", rs.getString("description"));
+                p.put("stock_qty", rs.getInt("stock_qty"));
+                p.put("price_per_ton", rs.getBigDecimal("price_per_ton"));
+                p.put("unit", rs.getString("unit"));
+                p.put("image_placeholder", rs.getString("image_placeholder"));
+                products.add(p);
+            }
+        } catch (SQLException e) {
+            sendJson(exchange, 500, Map.of("error", "Database error."));
+            return;
+        }
+        sendJson(exchange, 200, Map.of("products", products));
+    }
+
+    // POST /api/admin/login - admin login returns session token
+    private static void handleAdminLogin(HttpExchange exchange) throws IOException {
+        if (!"POST".equals(exchange.getRequestMethod())) {
+            send405(exchange);
+            return;
+        }
+        if (!rateLimit(exchange)) return;
+
+        String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+        Map<String, String> data = parseJson(body);
+        String username = data.get("username");
+        String password = data.get("password");
+
+        if (username == null || password == null) {
+            sendJson(exchange, 400, Map.of("success", false, "error", "Username and password required."));
+            return;
+        }
+
+        try (PreparedStatement ps = conn.prepareStatement("SELECT password_hash FROM admins WHERE username = ?")) {
+            ps.setString(1, username);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) {
+                String storedHash = rs.getString("password_hash");
+                if (storedHash.equals(sha256Hex(password))) {
+                    // Generate simple session token
+                    String token = UUID.randomUUID().toString();
+                    adminSessions.put(token, username);
+                    sendJson(exchange, 200, Map.of("success", true, "token", token));
+                    return;
+                }
+            }
+        } catch (SQLException e) {
+            sendJson(exchange, 500, Map.of("success", false, "error", "Database error."));
+            return;
+        }
+        sendJson(exchange, 401, Map.of("success", false, "error", "Invalid credentials."));
+    }
+
+    // GET /api/admin/orders - list orders (requires admin token)
+    private static void handleAdminOrders(HttpExchange exchange) throws IOException {
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            send405(exchange);
+            return;
+        }
+        if (!rateLimit(exchange)) return;
+
+        String auth = exchange.getRequestHeaders().getFirst("Authorization");
+        if (auth == null || !auth.startsWith("Bearer ")) {
+            sendJson(exchange, 401, Map.of("error", "Missing or invalid Authorization header."));
+            return;
+        }
+        String token = auth.substring(7);
+        if (!adminSessions.containsKey(token)) {
+            sendJson(exchange, 403, Map.of("error", "Invalid or expired session token."));
+            return;
+        }
+
+        List<Map<String, Object>> orders = new ArrayList<>();
+        try (Statement st = conn.createStatement()) {
+            ResultSet rs = st.executeQuery("""
+                SELECT o.id, p.name AS product_name, o.quantity, o.customer_name, o.customer_email, o.order_date
+                FROM orders o JOIN products p ON o.product_id = p.id
+                ORDER BY o.order_date DESC
+            """);
+            while (rs.next()) {
+                Map<String, Object> o = new LinkedHashMap<>();
+                o.put("id", rs.getLong("id"));
+                o.put("product_name", rs.getString("product_name"));
+                o.put("quantity", rs.getInt("quantity"));
+                o.put("customer_name", rs.getString("customer_name"));
+                o.put("customer_email", rs.getString("customer_email"));
+                o.put("order_date", rs.getTimestamp("order_date").toInstant().toString());
+                orders.add(o);
+            }
+        } catch (SQLException e) {
+            sendJson(exchange, 500, Map.of("error", "Database error."));
+            return;
+        }
+        sendJson(exchange, 200, Map.of("orders", orders));
+    }
+
+    // GET /api/docs - inline API documentation
+    private static void handleApiDocs(HttpExchange exchange) throws IOException {
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            send405(exchange);
+            return;
+        }
+        if (!rateLimit(exchange)) return;
+
+        String docs = """
+        {
+          "API Documentation": {
+            "/api/contact": {
+              "method": "POST",
+              "description": "Submit a contact inquiry.",
+              "request": {
+                "name": "string, required",
+                "email": "string, valid email, required",
+                "phone": "string, required",
+                "message": "string, required"
+              },
+              "response": {
+                "success": "boolean",
+                "message": "string on success",
+                "errors": "array of strings on validation failure"
+              },
+              "sample_curl": "curl -X POST http://localhost:8080/api/contact -H 'Content-Type: application/json' -d '{\\"name\\":\\"Ali Khan\\",\\"email\\":\\"ali@example.com\\",\\"phone\\":\\"03001234567\\",\\"message\\":\\"Need pricing info.\\"}'"
+            },
+            "/api/products": {
+              "method": "GET",
+              "description": "Get list of products with details.",
+              "response": {
+                "products": [
+                  {
+                    "id": "number",
+                    "name": "string",
+                    "description": "string",
+                    "stock_qty": "number",
+                    "price_per_ton": "decimal",
+                    "unit": "string",
+                    "image_placeholder": "string"
+                  }
+                ]
+              },
+              "sample_curl": "curl http://localhost:8080/api/products"
+            },
+            "/api/admin/login": {
+              "method": "POST",
+              "description": "Admin login, returns session token.",
+              "request": {
+                "username": "string",
+                "password": "string"
+              },
+              "response": {
+                "success": "boolean",
+                "token": "string if success",
+                "error": "string if failure"
+              },
+              "sample_curl": "curl -X POST http://localhost:8080/api/admin/login -H 'Content-Type: application/json' -d '{\\"username\\":\\"admin\\",\\"password\\":\\"Steel@2024NK\\"}'"
+            },
+            "/api/admin/orders": {
+              "method": "GET",
+              "description": "Get list of orders (admin only).",
+              "headers": {
+                "Authorization": "Bearer {token}"
+              },
+              "response": {
+                "orders": [
+                  {
+                    "id": "number",
+                    "product_name": "string",
+                    "quantity": "number",
+                    "customer_name": "string",
+                    "customer_email": "string",
+                    "order_date": "ISO8601 string"
+                  }
+                ]
+              },
+              "sample_curl": "curl http://localhost:8080/api/admin/orders -H 'Authorization: Bearer {token}'"
+            }
+          }
+        }
+        """;
+        byte[] bytes = docs.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+        exchange.sendResponseHeaders(200, bytes.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(bytes);
+        }
+    }
+
+    // --- UTILITIES ---
+
+    private static void send405(HttpExchange exchange) throws IOException {
+        exchange.getResponseHeaders().set("Allow", "GET, POST");
+        exchange.sendResponseHeaders(405, -1);
+        exchange.close();
+    }
+
+    private static boolean rateLimit(HttpExchange exchange) throws IOException {
+        String ip = exchange.getRemoteAddress().getAddress().getHostAddress();
+        long now = System.currentTimeMillis();
+        rateLimitResetMap.putIfAbsent(ip, now + 60_000);
+        if (now > rateLimitResetMap.get(ip)) {
+            rateLimitMap.put(ip, 0);
+            rateLimitResetMap.put(ip, now + 60_000);
+        }
+        int count = rateLimitMap.getOrDefault(ip, 0);
+        if (count >= MAX_REQUESTS_PER_MINUTE) {
+            String msg = "{\"error\":\"Too many requests. Please try again later.\"}";
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(429, msg.length());
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(msg.getBytes(StandardCharsets.UTF_8));
+            }
+            return false;
+        }
+        rateLimitMap.put(ip, count + 1);
+        return true;
+    }
+
+    private static void sendJson(HttpExchange exchange, int statusCode, Map<String, ?> data) throws IOException {
+        String json = toJson(data);
+        byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+        exchange.sendResponseHeaders(statusCode, bytes.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(bytes);
+        }
+    }
+
+    // Minimal JSON serializer for Map<String,Object> (no external libs)
+    private static
